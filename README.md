@@ -161,7 +161,11 @@ linked pages under one site are needed. Its limits are deliberate:
 - `basic`: maximum link depth 1
 - `advanced`: maximum link depth 2
 - at most 20 pages per call
-- Crawl4AI receives `include_external: false`; unrelated returned hosts are rejected again by the plugin
+- links are walked client-side (same-site only, absolute and `href=`-relative);
+  every discovered URL is policy-preflighted before it is fetched, and
+  returned documents whose URL left the seed host/subdomain are rejected
+- seed URLs carrying credential-like query parameters (e.g. `?token=…`) are
+  refused, matching Hermes core's `web_extract` input guard
 - configurable per-page character cap, maximum 200,000
 - public HTTP(S) targets only unless the user's Hermes URL-safety policy allows otherwise
 

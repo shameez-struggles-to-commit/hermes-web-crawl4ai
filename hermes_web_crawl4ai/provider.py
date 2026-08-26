@@ -95,20 +95,25 @@ _scrapling_log_prev_level: int | None = None
 
 @contextlib.contextmanager
 def _quiet_scrapling_logs():
+    """Silence scrapling's URL-bearing INFO logs for the duration.
+
+    The OUTERMOST context saves the level and the LAST context to exit
+    restores it — under interleaving the saver and the restorer are
+    routinely different contexts, so restoration keys on depth reaching
+    zero, never on ``first``."""
     global _scrapling_log_depth, _scrapling_log_prev_level
     scrapling_logger = logging.getLogger("scrapling")
     with _scrapling_log_lock:
-        first = _scrapling_log_depth == 0
-        _scrapling_log_depth += 1
-        if first:
+        if _scrapling_log_depth == 0:
             _scrapling_log_prev_level = scrapling_logger.level
             scrapling_logger.setLevel(logging.WARNING)
+        _scrapling_log_depth += 1
     try:
         yield
     finally:
         with _scrapling_log_lock:
             _scrapling_log_depth -= 1
-            if _scrapling_log_depth == 0 and first:
+            if _scrapling_log_depth == 0:
                 scrapling_logger.setLevel(
                     _scrapling_log_prev_level
                     if _scrapling_log_prev_level is not None
@@ -536,7 +541,13 @@ async def _stealth_fetch(url: str) -> dict[str, Any] | None:
         )
         return None
     final_url = final_url or url
-    if await _target_error(_url_without_query(final_url)):
+    try:
+        policy_url = _url_without_query(final_url)
+    except ValueError:
+        # Unparseable final URL (e.g. malformed IPv6 brackets) — fail safe:
+        # never return content from a URL we cannot verify.
+        policy_url = None
+    if policy_url is None or await _target_error(policy_url):
         logger.info(
             "scrapling_stealth host=%s outcome=blocked_final_url duration=%.1fs",
             host,
@@ -855,7 +866,13 @@ async def _fetch_document(url: str, *, format: str | None = None) -> dict[str, A
         return _typed_error_document(url, error_type, message)
 
     if document.get("error"):
-        # Already a typed per-URL failure (policy block, success=False, etc.).
+        # A typed per-URL failure (policy block, success=False, …). If the
+        # target looks like the suspect, give stealth the same chance the
+        # exception path gets before returning the error.
+        if probe_status is None or probe_status in (401, 403) or 500 <= probe_status < 600:
+            stealth = await _stealth_fetch(url)
+            if stealth:
+                return stealth
         return document
 
     gate = _classify_content(document.get("content") or "")
@@ -935,10 +952,28 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
     """
     try:
         import re
+        from urllib.parse import urljoin
+
+        from tools.web_tools import sensitive_query_param_name
 
         url = normalize_url_for_request(str(args.get("url") or "").strip())
         if not url:
             return json.dumps({"success": False, "error": "A URL is required"})
+        sensitive = sensitive_query_param_name(url)
+        if sensitive:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "Blocked: URL contains a credential-like query parameter "
+                        f"({sensitive}). Web extract backends are third-party "
+                        "readers; remove the sensitive query parameter or use a "
+                        "local browser session when this access is explicitly "
+                        "required."
+                    ),
+                    "url": _url_without_query(url),
+                }
+            )
         error = await _target_error(url)
         if error:
             return json.dumps({"success": False, "error": error, "url": url})
@@ -947,17 +982,44 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
         max_depth = 2 if args.get("depth") == "advanced" else 1
         timeout = _bounded_int("timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 10, 300)
 
-        link_re = re.compile(r"https?://[^\s<>\"')\]]+")
+        link_re = re.compile(
+            r"""(?:https?://[^\s<>"')\]]+)|(?:href\s*=\s*["']([^"']+)["'])""",
+            re.IGNORECASE,
+        )
 
         seen: set[str] = set()
+        queued: set[str] = {url}
         queue: list[tuple[str, int]] = [(url, 0)]
         documents: list[dict[str, Any]] = []
+
+        def _candidates(text: str, page_url: str):
+            """Yield absolute same-site URLs found in markdown or hrefs —
+            relative hrefs resolved against the page they appeared on."""
+            for match in link_re.finditer(text):
+                absolute = match.group(1)
+                if absolute is None:
+                    absolute = match.group(0)
+                    if absolute.lower().startswith(("mailto:", "javascript:", "tel:", "data:")):
+                        continue
+                candidate = urljoin(page_url, absolute).rstrip(".,;!?)")
+                if candidate in seen or candidate in queued:
+                    continue
+                if not candidate.lower().startswith(("http://", "https://")):
+                    continue
+                if _is_same_site(url, candidate):
+                    yield candidate
 
         while queue and len(documents) < max_pages:
             current, depth = queue.pop(0)
             if current in seen:
                 continue
             seen.add(current)
+
+            # Policy preflight BEFORE the fetch — a link discovered on a
+            # crawled page gets the same safety treatment as a user-supplied
+            # seed, never weaker.
+            if await _target_error(current):
+                continue
 
             try:
                 raw = await _post_json("/md", {"url": current, "f": "fit"}, timeout=timeout)
@@ -982,10 +1044,9 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
 
             if depth < max_depth:
                 text = str(document.get("content") or document.get("raw_content") or "")
-                for match in link_re.finditer(text):
-                    candidate = match.group(0).rstrip(".,;!?)")
-                    if candidate not in seen and _is_same_site(url, candidate):
-                        queue.append((candidate, depth + 1))
+                for candidate in _candidates(text, current):
+                    queued.add(candidate)
+                    queue.append((candidate, depth + 1))
 
         return json.dumps({"results": documents}, ensure_ascii=False)
     except asyncio.CancelledError:

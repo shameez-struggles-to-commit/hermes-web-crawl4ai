@@ -837,3 +837,214 @@ async def test_crawl_tool_advanced_depth_walks_two_levels_not_three(
         "https://example.com/l2",
     ]
     assert len(result["results"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Round-3 review fixes: success=False escalation, crawl BFS hardening,
+# logger race, malformed final URLs, queue dedup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_success_false_with_403_probe_escalates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # HTTP 200 from Crawl4AI but success=false in the body, target probed 403:
+    # the target is the suspect — stealth gets the same chance as the
+    # exception path.
+    await _stub_probe(monkeypatch, 403)
+    monkeypatch.setattr(
+        provider_module,
+        "_crawl4ai_fetch",
+        AsyncMock(
+            return_value={
+                "url": "https://blocked.example/page",
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "metadata": {},
+                "error": "Target returned HTTP 403",
+                "error_type": "blocked",
+            }
+        ),
+    )
+    stealth = AsyncMock(return_value=_escalation_doc())
+    monkeypatch.setattr(provider_module, "_stealth_fetch", stealth)
+
+    result = await _run_fetch_document()
+
+    stealth.assert_awaited_once()
+    assert result["metadata"]["resolved_by"] == "scrapling_stealth"
+
+
+@pytest.mark.asyncio
+async def test_success_false_with_200_probe_does_not_escalate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _stub_probe(monkeypatch, 200)
+    monkeypatch.setattr(
+        provider_module,
+        "_crawl4ai_fetch",
+        AsyncMock(
+            return_value={
+                "url": "https://ok.example/page",
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "metadata": {},
+                "error": "some backend error",
+            }
+        ),
+    )
+    stealth = AsyncMock(return_value=_escalation_doc())
+    monkeypatch.setattr(provider_module, "_stealth_fetch", stealth)
+
+    result = await _run_fetch_document()
+
+    stealth.assert_not_awaited()
+    assert result["error"] == "some backend error"
+
+
+@pytest.mark.asyncio
+async def test_crawl_child_preflighted_before_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_module,
+        "_target_error",
+        AsyncMock(side_effect=lambda u: "denied" if "forbidden" in u else None),
+    )
+    posts: list[str] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        posts.append(payload["url"])
+        if payload["url"].endswith("seed"):
+            return {
+                "url": payload["url"],
+                "markdown": "https://example.com/forbidden-child",
+                "success": True,
+            }
+        raise AssertionError("forbidden child must never be fetched")
+
+    monkeypatch.setattr(provider_module, "_post_json", post)
+
+    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com/seed"}))
+
+    assert posts == ["https://example.com/seed"]
+    assert len(result["results"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_crawl_rejects_credential_like_seed_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted = AsyncMock()
+    monkeypatch.setattr(provider_module, "_post_json", posted)
+
+    result = json.loads(
+        await crawl4ai_crawl_tool({"url": "https://example.com/p?token=sekrit"})
+    )
+
+    posted.assert_not_awaited()
+    assert result["success"] is False
+    assert "credential-like query parameter" in result["error"]
+    assert "sekrit" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_crawl_follows_relative_hrefs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    pages: dict[str, dict] = {
+        "https://example.com/docs/": {
+            "url": "https://example.com/docs/",
+            "markdown": 'seed <a href="/docs/child">c</a> <a href="sibling">s</a>',
+            "success": True,
+        },
+        "https://example.com/docs/child": {
+            "url": "https://example.com/docs/child",
+            "markdown": "child page",
+            "success": True,
+        },
+        "https://example.com/docs/sibling": {
+            "url": "https://example.com/docs/sibling",
+            "markdown": "sibling page",
+            "success": True,
+        },
+    }
+    calls: list[str] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        calls.append(payload["url"])
+        return pages[payload["url"]]
+
+    monkeypatch.setattr(provider_module, "_post_json", post)
+
+    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com/docs/"}))
+
+    assert "https://example.com/docs/child" in calls
+    assert "https://example.com/docs/sibling" in calls
+    assert {doc["url"] for doc in result["results"]} == set(pages)
+
+
+@pytest.mark.asyncio
+async def test_quiet_scrapling_logs_restores_level_under_interleaving():
+    import logging as _logging
+
+    scrapling_logger = _logging.getLogger("scrapling")
+    original = scrapling_logger.level
+    try:
+        ctx_a = provider_module._quiet_scrapling_logs()
+        ctx_b = provider_module._quiet_scrapling_logs()
+        ctx_a.__enter__()
+        ctx_b.__enter__()
+        assert scrapling_logger.level == _logging.WARNING
+        # Exit order reversed from entry order; one exits via exception.
+        ctx_b.__exit__(None, None, None)
+        ctx_a.__exit__(RuntimeError, RuntimeError("fetch failed"), None)
+        assert provider_module._scrapling_log_depth == 0
+        assert scrapling_logger.level == original
+    finally:
+        scrapling_logger.setLevel(original)
+        provider_module._scrapling_log_depth = 0
+        provider_module._scrapling_log_prev_level = None
+
+
+@pytest.mark.asyncio
+async def test_stealth_malformed_final_url_fails_safe(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    _install_fake_fetcher(
+        monkeypatch, _FakePage("legit content " * 40, "http://[::1")
+    )
+
+    with caplog.at_level(logging.INFO, logger="hermes_web_crawl4ai.provider"):
+        result = await provider_module._stealth_fetch("https://public.example/x")
+
+    assert result is None
+    assert any("outcome=blocked_final_url" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_crawl_queue_dedups_repeated_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    spam = " ".join(["https://example.com/once"] * 5000)
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        if payload["url"].endswith("/seed"):
+            return {
+                "url": payload["url"],
+                "markdown": f"seed {spam}",
+                "success": True,
+            }
+        return {"url": payload["url"], "markdown": "child", "success": True}
+
+    posted = AsyncMock(side_effect=post)
+    monkeypatch.setattr(provider_module, "_post_json", posted)
+
+    await crawl4ai_crawl_tool({"url": "https://example.com/seed"})
+
+    assert posted.await_count == 2  # seed + the single deduped child
