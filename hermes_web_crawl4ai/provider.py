@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import threading
+import time
 from functools import lru_cache
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -71,6 +72,16 @@ _GATE_MESSAGES = {
     "rate_limited": "Page rate-limited the request",
     "empty": "Page returned no extractable content",
 }
+
+# Exception-path failures a real browser can plausibly rescue: the target
+# blocked/challenged us (401/403 → blocked; 5xx incl. Cloudflare's 503
+# challenge → upstream_error). Combined with ``probe_status is None`` at the
+# call site this covers unclassifiable targets too. Deliberately excludes
+# rate_limited (browser shares the IP/limit), not_found (404/410 return
+# earlier), and unmapped statuses (200/204/400/405 … → "crawl4ai_error"):
+# a mapped-healthy probe with Crawl4AI erroring means OUR infrastructure is
+# the suspect, and escalation would only mask the outage.
+_STEALTHABLE_ERROR_TYPES = frozenset({"blocked", "upstream_error"})
 
 
 def _classify_content(content: str) -> Optional[str]:
@@ -425,21 +436,38 @@ async def _resolve_scrapling_fetcher_async():
 
 async def _stealth_fetch(url: str) -> dict[str, Any] | None:
     """Last-resort stealth fetch via scrapling when the content gate flags a
-    challenge/block on an otherwise-successful Crawl4AI response. scrapling's
-    StealthyFetcher is synchronous, so it runs in a worker thread. Returns
-    None on any failure.
+    challenge/block, or the exception path sees the target block/challenge us.
 
-    Scope note: this does NOT run when Crawl4AI itself errors out (container
-    down, connection refused, HTTP 5xx) — only when a fetched document is
-    classified as a challenge/block by the content gate.
+    StealthyFetcher is synchronous, so it runs in a worker thread; cancelling
+    the caller does NOT stop the browser run (best-effort cancellation). The
+    result is policy-checked against the browser's FINAL url (redirects can
+    land on private networks), truncated to ``max_chars_per_page``, and logged
+    host-only (query strings never enter logs). Returns None on any failure.
+
+    Outcome vocabulary (log token ``scrapling_stealth``, grep-able):
+    ``unavailable | failed | blocked_final_url | thin_content | rescued``.
+
+    Scope note: this runs when a fetched document is classified as a
+    challenge/block/empty shell by the content gate, and — from the exception
+    path — when the target itself blocked/challenged us (401/403/5xx probe)
+    or the probe could not classify the target at all. It never runs to mask
+    a Crawl4AI outage (mapped-healthy probe + exception stays a typed error).
 
     Browser engines are provisioned separately — after the first install, run
     ``scrapling install`` once (see scrapling's docs) — see README."""
+    started = time.monotonic()
+    host = urlparse(url).hostname or "unknown"
+
     fetcher_cls = await _resolve_scrapling_fetcher_async()
     if fetcher_cls is None:
+        logger.info(
+            "scrapling_stealth host=%s outcome=unavailable duration=%.1fs",
+            host,
+            time.monotonic() - started,
+        )
         return None
 
-    def _run() -> str:
+    def _run() -> tuple[str, str]:
         fetcher = fetcher_cls()
         page = fetcher.fetch(
             url,
@@ -449,21 +477,50 @@ async def _stealth_fetch(url: str) -> dict[str, Any] | None:
             wait_selector="body",
             timeout=30000,
         )
-        return (page.get_all_text() if page else "") or ""
+        if page is None:
+            return ("", "")
+        text = (page.get_all_text() if page else "") or ""
+        return (text, str(getattr(page, "url", "") or url))
 
     try:
-        text = (await asyncio.to_thread(_run)).strip()
+        text, final_url = await asyncio.to_thread(_run)
     except Exception:  # noqa: BLE001
+        logger.info(
+            "scrapling_stealth host=%s outcome=failed duration=%.1fs",
+            host,
+            time.monotonic() - started,
+        )
         return None
+    final_url = final_url or url
+    if await _target_error(final_url):
+        logger.info(
+            "scrapling_stealth host=%s outcome=blocked_final_url duration=%.1fs",
+            host,
+            time.monotonic() - started,
+        )
+        return None
+    text = text.strip()
     if not text or _classify_content(text):
+        logger.info(
+            "scrapling_stealth host=%s outcome=thin_content duration=%.1fs",
+            host,
+            time.monotonic() - started,
+        )
         return None
-    return {
-        "url": url,
-        "title": "",
-        "content": text,
-        "raw_content": text,
-        "metadata": {"resolved_by": "scrapling_stealth"},
-    }
+    logger.info(
+        "scrapling_stealth host=%s outcome=rescued duration=%.1fs",
+        host,
+        time.monotonic() - started,
+    )
+    return _truncate_document(
+        {
+            "url": final_url,
+            "title": "",
+            "content": text,
+            "raw_content": text,
+            "metadata": {"resolved_by": "scrapling_stealth"},
+        }
+    )
 
 
 @lru_cache(maxsize=1)
@@ -735,6 +792,14 @@ async def _fetch_document(url: str, *, format: str | None = None) -> dict[str, A
         else:
             error_type = "crawl4ai_error"
             message = f"Crawl4AI extract failed: {exc}"
+        # Escalate only when the TARGET is the suspect (it blocked/challenged
+        # us) or the probe could not classify it at all. A mapped-healthy
+        # probe (e.g. 200) with Crawl4AI erroring means our infrastructure —
+        # never mask that outage with a doomed browser run.
+        if probe_status is None or error_type in _STEALTHABLE_ERROR_TYPES:
+            stealth = await _stealth_fetch(url)
+            if stealth:
+                return stealth
         return _typed_error_document(url, error_type, message)
 
     if document.get("error"):
@@ -745,7 +810,10 @@ async def _fetch_document(url: str, *, format: str | None = None) -> dict[str, A
     if not gate:
         return document
 
-    if gate in ("challenge", "blocked"):
+    if gate in ("challenge", "blocked", "empty"):
+        # JS-heavy pages can render as an "empty" shell over plain HTTP; a
+        # real browser is the only way to render them. rate_limited stays
+        # excluded: the browser shares the same IP and limit.
         stealth = await _stealth_fetch(url)
         if stealth:
             return stealth

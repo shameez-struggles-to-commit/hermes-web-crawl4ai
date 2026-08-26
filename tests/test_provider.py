@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -236,9 +238,6 @@ async def test_crawl_tool_rejects_cross_site_results(
 # ---------------------------------------------------------------------------
 # Stealth escalation (exception path + content gate) — plan v3
 # ---------------------------------------------------------------------------
-
-import asyncio
-import logging
 
 
 def _escalation_doc(url: str = "https://blocked.example/page") -> dict:
@@ -626,6 +625,7 @@ async def test_crawl_tool_does_not_escalate(monkeypatch: pytest.MonkeyPatch) -> 
 async def test_extract_cancelled_during_stealth_propagates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
     await _stub_probe(monkeypatch, 403)
     monkeypatch.setattr(
         provider_module, "_crawl4ai_fetch", AsyncMock(side_effect=Exception("500"))
