@@ -83,6 +83,45 @@ _GATE_MESSAGES = {
 # the suspect, and escalation would only mask the outage.
 _STEALTHABLE_ERROR_TYPES = frozenset({"blocked", "upstream_error"})
 
+# Scrapling's own logger prints full request URLs — including query strings
+# (which can carry tokens) — at INFO level. Silence it for the duration of a
+# stealth fetch. Reference-counted so concurrent fetches restore the level
+# only when the last one finishes; best-effort if someone else touches the
+# logger between our enter/exit.
+_scrapling_log_lock = threading.Lock()
+_scrapling_log_depth = 0
+_scrapling_log_prev_level: int | None = None
+
+
+@contextlib.contextmanager
+def _quiet_scrapling_logs():
+    global _scrapling_log_depth, _scrapling_log_prev_level
+    scrapling_logger = logging.getLogger("scrapling")
+    with _scrapling_log_lock:
+        first = _scrapling_log_depth == 0
+        _scrapling_log_depth += 1
+        if first:
+            _scrapling_log_prev_level = scrapling_logger.level
+            scrapling_logger.setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        with _scrapling_log_lock:
+            _scrapling_log_depth -= 1
+            if _scrapling_log_depth == 0 and first:
+                scrapling_logger.setLevel(
+                    _scrapling_log_prev_level
+                    if _scrapling_log_prev_level is not None
+                    else logging.NOTSET
+                )
+
+
+def _url_without_query(url: str) -> str:
+    """Drop query string and fragment — for policy checks (host-based) and
+    anywhere a URL must not leak credential-like parameters."""
+    parsed = urlparse(url)
+    return parsed._replace(query="", fragment="").geturl()
+
 
 def _classify_content(content: str) -> Optional[str]:
     """Return a failure classification when ``content`` looks like a block /
@@ -440,9 +479,13 @@ async def _stealth_fetch(url: str) -> dict[str, Any] | None:
 
     StealthyFetcher is synchronous, so it runs in a worker thread; cancelling
     the caller does NOT stop the browser run (best-effort cancellation). The
-    result is policy-checked against the browser's FINAL url (redirects can
-    land on private networks), truncated to ``max_chars_per_page``, and logged
-    host-only (query strings never enter logs). Returns None on any failure.
+    result is policy-checked against the browser's FINAL url (query-stripped
+    — policy matching is host-based; this is OUTPUT filtering: unsafe content
+    is never returned, but redirects are not blocked request-time), truncated
+    to ``max_chars_per_page``, and logged host-only (query strings never enter
+    logs; scrapling's own INFO logging is silenced for the fetch). Returns
+    None on any failure. The returned document carries the ORIGINAL url — the
+    final redirect url may carry credential-like query parameters.
 
     Outcome vocabulary (log token ``scrapling_stealth``, grep-able):
     ``unavailable | failed | blocked_final_url | thin_content | rescued``.
@@ -469,14 +512,15 @@ async def _stealth_fetch(url: str) -> dict[str, Any] | None:
 
     def _run() -> tuple[str, str]:
         fetcher = fetcher_cls()
-        page = fetcher.fetch(
-            url,
-            headless=True,
-            solve_cloudflare=True,
-            network_idle=True,
-            wait_selector="body",
-            timeout=30000,
-        )
+        with _quiet_scrapling_logs():
+            page = fetcher.fetch(
+                url,
+                headless=True,
+                solve_cloudflare=True,
+                network_idle=True,
+                wait_selector="body",
+                timeout=30000,
+            )
         if page is None:
             return ("", "")
         text = (page.get_all_text() if page else "") or ""
@@ -492,7 +536,7 @@ async def _stealth_fetch(url: str) -> dict[str, Any] | None:
         )
         return None
     final_url = final_url or url
-    if await _target_error(final_url):
+    if await _target_error(_url_without_query(final_url)):
         logger.info(
             "scrapling_stealth host=%s outcome=blocked_final_url duration=%.1fs",
             host,
@@ -514,11 +558,16 @@ async def _stealth_fetch(url: str) -> dict[str, Any] | None:
     )
     return _truncate_document(
         {
-            "url": final_url,
+            # Original (already-validated) URL — the browser's final redirect
+            # URL may carry credential-like query parameters.
+            "url": url,
             "title": "",
             "content": text,
             "raw_content": text,
-            "metadata": {"resolved_by": "scrapling_stealth"},
+            "metadata": {
+                "resolved_by": "scrapling_stealth",
+                "final_url": _url_without_query(final_url),
+            },
         }
     )
 
@@ -918,6 +967,16 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
                     document = _normalize_document(raw, fallback_url=current)
             except Exception as exc:  # noqa: BLE001 - one failed page must not kill the crawl
                 document = _error_document(current, f"Crawl4AI fetch failed: {exc}")
+
+            # The queue filters candidate links, but the endpoint itself can
+            # still return a redirected/unrelated document — enforce the
+            # same-site boundary on output too.
+            doc_url = str(document.get("url") or current)
+            if not _is_same_site(url, doc_url):
+                document = _error_document(
+                    doc_url,
+                    "Result URL left the seed site and was not returned",
+                )
 
             documents.append(await _secure_document(document, current))
 

@@ -577,12 +577,16 @@ async def test_stealth_logs_host_only_no_query_leak(
         )
 
     assert result is not None
-    assert result["url"] == "https://ok.example/page?token=sekrit&next=/admin"
+    # The ORIGINAL url is returned; the final redirect url (query-stripped)
+    # lives in metadata — never a credential-bearing URL in the doc body.
+    assert result["url"] == "https://ok.example/page?token=sekrit"
+    assert result["metadata"]["final_url"] == "https://ok.example/page"
     joined = " | ".join(rec.message for rec in caplog.records)
     assert "outcome=rescued" in joined
     assert "host=ok.example" in joined
     assert "sekrit" not in joined
     assert "token=" not in joined
+    assert "token=" not in result["metadata"]["final_url"]
 
 
 @pytest.mark.asyncio
@@ -681,3 +685,155 @@ async def test_html_format_escalation_returns_text(
     stealth.assert_awaited_once()
     # Documented limitation: stealth always returns text, never HTML.
     assert result["content"] == "rescued content " * 20
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review fixes: cross-logger leaks, URL hygiene, crawl output bounds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stealth_silences_scrapling_logger(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    class _NoisyFetcher:
+        def fetch(self, url: str, **kwargs):
+            logging.getLogger("scrapling").info(
+                "Fetched (200) <GET %s?token=sekrit>", url
+            )
+            return _FakePage("legit content " * 40, "https://ok.example/page")
+
+    monkeypatch.setattr(
+        provider_module,
+        "_resolve_scrapling_fetcher_async",
+        AsyncMock(return_value=_NoisyFetcher),
+    )
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+
+    prior_level = logging.getLogger("scrapling").level
+    with caplog.at_level(logging.INFO, logger="scrapling"):
+        result = await provider_module._stealth_fetch("https://ok.example/page")
+
+    assert result is not None
+    assert not any("sekrit" in rec.getMessage() for rec in caplog.records)
+    # Level restored to whatever it was before the fetch (INFO when scrapling
+    # is loaded for real; NOTSET in this offline test environment).
+    assert logging.getLogger("scrapling").level == prior_level
+
+
+@pytest.mark.asyncio
+async def test_stealth_policy_check_uses_query_stripped_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_fetcher(
+        monkeypatch,
+        _FakePage("legit content " * 40, "https://ok.example/page?token=sekrit"),
+    )
+    seen: list[str] = []
+
+    async def policy(url: str):
+        seen.append(url)
+        return None
+
+    monkeypatch.setattr(provider_module, "_target_error", policy)
+
+    result = await provider_module._stealth_fetch("https://ok.example/page")
+
+    assert result is not None
+    # The policy layer saw the final URL WITHOUT the query string — a
+    # downstream logger there can never print ?token=sekrit.
+    assert seen == ["https://ok.example/page"]
+
+
+@pytest.mark.asyncio
+async def test_stealth_returns_original_url_not_credential_bearing_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_fetcher(
+        monkeypatch,
+        _FakePage(
+            "legit content " * 40,
+            "https://ok.example/redirected?token=opaque-secret&next=/admin",
+        ),
+    )
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+
+    result = await provider_module._stealth_fetch("https://ok.example/page")
+
+    assert result is not None
+    assert result["url"] == "https://ok.example/page"
+    # Query-stripped final URL preserved for traceability.
+    assert result["metadata"]["final_url"] == "https://ok.example/redirected"
+    assert "opaque-secret" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_crawl_tool_rejects_returned_document_that_left_seed_site(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        provider_module,
+        "_post_json",
+        AsyncMock(
+            return_value={
+                "url": "https://unrelated.example/page",
+                "markdown": "content from an unrelated host",
+                "success": True,
+            }
+        ),
+    )
+
+    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com"}))
+
+    assert result["results"][0]["content"] == ""
+    assert "left the seed site" in result["results"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_tool_advanced_depth_walks_two_levels_not_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    pages: dict[str, dict] = {
+        "https://example.com/root": {
+            "url": "https://example.com/root",
+            "markdown": "root https://example.com/l1",
+            "success": True,
+        },
+        "https://example.com/l1": {
+            "url": "https://example.com/l1",
+            "markdown": "l1 https://example.com/l2",
+            "success": True,
+        },
+        "https://example.com/l2": {
+            "url": "https://example.com/l2",
+            "markdown": "l2 https://example.com/l3",
+            "success": True,
+        },
+        "https://example.com/l3": {
+            "url": "https://example.com/l3",
+            "markdown": "must never be fetched in advanced mode",
+            "success": True,
+        },
+    }
+    calls: list[str] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        calls.append(payload["url"])
+        return pages[payload["url"]]
+
+    monkeypatch.setattr(provider_module, "_post_json", post)
+
+    result = json.loads(
+        await crawl4ai_crawl_tool(
+            {"url": "https://example.com/root", "depth": "advanced"}
+        )
+    )
+
+    assert calls == [
+        "https://example.com/root",
+        "https://example.com/l1",
+        "https://example.com/l2",
+    ]
+    assert len(result["results"]) == 3

@@ -24,10 +24,21 @@ stealth fetch via [scrapling]. Stealth engages in two places:
    plain HTTP fetch renders thin).
 
 Every stealth result is policy-checked against the browser's *final* URL
-(redirects can land on private networks), truncated to
-`max_chars_per_page`, and logged host-only with a grep-able
+(query-stripped — matching is host-based) and truncated to
+`max_chars_per_page`. Logs are host-only with a grep-able
 `scrapling_stealth` token and outcome (`unavailable | failed |
-blocked_final_url | thin_content | rescued`).
+blocked_final_url | thin_content | rescued`); scrapling's own INFO logging
+(full request URLs) is silenced during the fetch. The returned document
+carries the *original* URL — redirect targets can carry credential-like
+query parameters. The final URL (query-stripped) is kept in
+`metadata.final_url`.
+
+**SSRF scope, stated honestly:** the final-URL check is *output filtering*
+— content a redirect delivered from an unsafe host is never returned. It
+does NOT block the request at redirect time: intermediate hops,
+subresources, and scripts still load wherever the target sends them.
+Request-time blocking is not exposed by scrapling's public fetch API and
+remains future work.
 
 Known limits, stated plainly:
 
