@@ -27,6 +27,10 @@ DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_CONCURRENCY = 4
 DEFAULT_MAX_CHARS = 20_000
 MAX_CRAWL_PAGES = 20
+# Per-page cap on raw links examined during a crawl. Rejected candidates
+# (cross-site, credential-bearing, non-HTTP) count against it too, so a page
+# stuffed with junk links cannot force unbounded scanning work.
+_MAX_LINKS_EXAMINED_PER_PAGE = 2_000
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +132,37 @@ def _url_without_query(url: str) -> str:
     return parsed._replace(query="", fragment="").geturl()
 
 
+def _url_has_userinfo(url: str) -> bool:
+    """True when the URL carries authority credentials (alice:sekrit@host) —
+    httpx would send them as Basic auth to the backend."""
+    try:
+        parsed = urlparse(url)
+        return bool(parsed.username) or parsed.password is not None
+    except ValueError:
+        return True  # unparseable → fail closed
+
+
+def _sanitize_url_for_output(url: str) -> str:
+    """Strip credential-like query params and authority userinfo from a URL
+    before it reaches logs or the caller. Host-based policy matching is
+    unaffected; non-sensitive query strings are preserved verbatim."""
+    try:
+        from tools.web_tools import sensitive_query_param_name
+    except Exception:  # pragma: no cover — Hermes core always provides it
+        return url
+    try:
+        stripped = _url_without_query(url) if sensitive_query_param_name(url) else url
+        parsed = urlparse(stripped)
+        if parsed.username or parsed.password is not None:
+            host = parsed.hostname or ""
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            stripped = parsed._replace(netloc=host).geturl()
+        return stripped
+    except ValueError:
+        return url
+
+
 def _classify_content(content: str) -> Optional[str]:
     """Return a failure classification when ``content`` looks like a block /
     challenge wall or an empty shell rather than real page content; else None."""
@@ -181,6 +216,12 @@ async def _probe_status(url: str) -> tuple[Optional[int], Optional[str]]:
     try:
         async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
             resp = await client.head(url, headers={"User-Agent": _PROBE_UA})
+            # Redirect-following here is for status/content-type detection
+            # only (no body is read), but the final hop must still respect
+            # policy — a redirect into a private network must not even leak
+            # a status code back through escalation decisions.
+            if await _target_error(str(resp.url)):
+                return None, None
             return resp.status_code, resp.headers.get("content-type", "")
     except Exception:  # noqa: BLE001
         pass
@@ -191,6 +232,8 @@ async def _probe_status(url: str) -> tuple[Optional[int], Optional[str]]:
             async with client.stream(
                 "GET", url, headers={"User-Agent": _PROBE_UA}
             ) as resp:
+                if await _target_error(str(resp.url)):
+                    return None, None
                 return resp.status_code, resp.headers.get("content-type", "")
     except Exception:  # noqa: BLE001
         return None, None
@@ -208,6 +251,12 @@ async def _extract_pdf(url: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             resp = await client.get(url, headers={"Accept": "application/pdf,*/*"})
             resp.raise_for_status()
+            # A redirect can land on a private network — validate the FINAL
+            # hop BEFORE reading the body, not after.
+            if await _target_error(str(resp.url)):
+                return _typed_error_document(
+                    url, "blocked", "PDF redirect target is not allowed by policy"
+                )
             data = resp.content
         if not data:
             return _typed_error_document(url, "empty", "PDF returned no bytes")
@@ -691,6 +740,14 @@ def _normalize_document(item: Any, fallback_url: str = "") -> dict[str, Any]:
     )
     title = plain.get("title") or metadata.get("title") or ""
 
+    # Backend metadata is untrusted input and reaches the caller as-is:
+    # sanitize URL-bearing fields so credential-like query params / userinfo
+    # from redirected URLs never leak out through metadata.
+    if isinstance(metadata, dict):
+        for key in ("sourceURL", "url", "redirected_url"):
+            if isinstance(metadata.get(key), str):
+                metadata[key] = _sanitize_url_for_output(metadata[key])
+
     result: dict[str, Any] = {
         "url": str(url or ""),
         "title": str(title or ""),
@@ -791,7 +848,7 @@ async def _secure_document(document: dict[str, Any], fallback_url: str) -> dict[
     error = await _target_error(url)
     if error:
         return _error_document(url, error)
-    document["url"] = url
+    document["url"] = _sanitize_url_for_output(url)
     return _truncate_document(document)
 
 
@@ -924,6 +981,12 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
         async def extract_one(url: str) -> dict[str, Any]:
             try:
                 normalized_url = normalize_url_for_request(url)
+                if _url_has_userinfo(normalized_url):
+                    return _error_document(
+                        normalized_url,
+                        "Blocked: URL contains embedded credentials (userinfo); "
+                        "web extract backends are third-party readers",
+                    )
                 error = await _target_error(normalized_url)
                 if error:
                     return _error_document(normalized_url, error)
@@ -956,26 +1019,31 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
     """
     try:
         import re
-        from urllib.parse import urljoin, urldefrag
+        from urllib.parse import urldefrag, urljoin
 
         from tools.web_tools import sensitive_query_param_name
 
         url = normalize_url_for_request(str(args.get("url") or "").strip())
         if not url:
             return json.dumps({"success": False, "error": "A URL is required"})
+        url = urldefrag(url).url  # canonicalize: #fragment variants are one page
         sensitive = sensitive_query_param_name(url)
-        if sensitive:
+        if sensitive or _url_has_userinfo(url):
+            reason = (
+                f"a credential-like query parameter ({sensitive})"
+                if sensitive
+                else "embedded credentials (userinfo)"
+            )
             return json.dumps(
                 {
                     "success": False,
                     "error": (
-                        "Blocked: URL contains a credential-like query parameter "
-                        f"({sensitive}). Web extract backends are third-party "
-                        "readers; remove the sensitive query parameter or use a "
-                        "local browser session when this access is explicitly "
+                        f"Blocked: URL contains {reason}. Web extract backends are "
+                        "third-party readers; remove the sensitive parameter or use "
+                        "a local browser session when this access is explicitly "
                         "required."
                     ),
-                    "url": _url_without_query(url),
+                    "url": _sanitize_url_for_output(url),
                 }
             )
         error = await _target_error(url)
@@ -995,13 +1063,19 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
         queued: set[str] = {url}
         queue: list[tuple[str, int]] = [(url, 0)]
         documents: list[dict[str, Any]] = []
+        examined: list[int] = [0]
 
-        def _candidates(text: str, page_url: str):
+        def _candidates(text: str, page_url: str, examined: list[int]):
             """Yield absolute same-site URLs found in markdown or hrefs —
             relative hrefs resolved against the page they appeared on.
             Fragments are canonicalized away, credential-like query
-            parameters disqualify a candidate outright."""
+            parameters or userinfo disqualify a candidate outright, and
+            ``examined`` bounds how many raw links a page may force us to
+            look at (rejected candidates count too)."""
             for match in link_re.finditer(text):
+                if examined[0] >= _MAX_LINKS_EXAMINED_PER_PAGE:
+                    return
+                examined[0] += 1
                 absolute = match.group(1)
                 if absolute is None:
                     absolute = match.group(0)
@@ -1014,7 +1088,7 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
                     continue
                 if not candidate.lower().startswith(("http://", "https://")):
                     continue
-                if sensitive_query_param_name(candidate):
+                if _url_has_userinfo(candidate) or sensitive_query_param_name(candidate):
                     # Never send credential-bearing URLs to the backend.
                     continue
                 if _is_same_site(url, candidate):
@@ -1056,13 +1130,13 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
 
             documents.append(await _secure_document(document, current))
 
-            if depth < max_depth:
+            if depth < max_depth and len(documents) + len(queue) < max_pages:
                 text = str(document.get("content") or document.get("raw_content") or "")
-                for candidate in _candidates(text, current):
+                for candidate in _candidates(text, current, examined):
                     queued.add(candidate)
                     queue.append((candidate, depth + 1))
-                    # Bound scanning too: once the page budget is fully
-                    # spoken for (fetched + queued), stop extracting links.
+                    # Once the page budget is fully spoken for
+                    # (fetched + queued), stop extracting links.
                     if len(documents) + len(queue) >= max_pages:
                         break
 

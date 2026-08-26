@@ -1192,3 +1192,213 @@ async def test_crawl_malformed_backend_url_does_not_abort(
     # Per-page rejection, not a whole-tool failure.
     assert "success" not in result or result.get("results") is not None
     assert result["results"][0]["content"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Round-5 review fixes: userinfo rejection, PDF final-hop policy,
+# metadata/output sanitization, seed canonicalization, rejected-scan bound
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crawl_rejects_userinfo_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    posted = AsyncMock()
+    monkeypatch.setattr(provider_module, "_post_json", posted)
+
+    result = json.loads(
+        await crawl4ai_crawl_tool({"url": "https://alice:sekrit@example.com/seed"})
+    )
+
+    posted.assert_not_awaited()
+    assert result["success"] is False
+    assert "userinfo" in result["error"]
+    assert "sekrit" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_crawl_userinfo_child_never_fetched(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    posted: list[str] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        posted.append(payload["url"])
+        if payload["url"].endswith("/seed"):
+            return {
+                "url": payload["url"],
+                "markdown": 'seed <a href="https://alice:sekrit@example.com/child">c</a>',
+                "success": True,
+            }
+        raise AssertionError("userinfo child must never be fetched")
+
+    monkeypatch.setattr(provider_module, "_post_json", post)
+
+    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com/seed"}))
+
+    assert posted == ["https://example.com/seed"]
+    assert len(result["results"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_rejects_userinfo_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = Crawl4AIWebSearchProvider()
+    monkeypatch.setattr(provider_module, "_api_url", lambda: "http://localhost:11235")
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    fetch = AsyncMock()
+    monkeypatch.setattr(provider_module, "_fetch_document", fetch)
+
+    docs = await provider.extract(["https://alice:sekrit@example.com/page"])
+
+    fetch.assert_not_awaited()
+    assert "userinfo" in docs[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_pdf_redirect_private_target_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeResp:
+        url = "http://127.0.0.1:9/private.pdf"
+        content = b"%PDF-1.4 internal secret"
+
+        def raise_for_status(self):
+            return None
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, headers):
+            return _FakeResp()
+
+    monkeypatch.setattr(provider_module.httpx, "AsyncClient", _FakeClient)
+    # Real _target_error is mocked; make it deny the private final hop.
+    monkeypatch.setattr(
+        provider_module,
+        "_target_error",
+        AsyncMock(side_effect=lambda u: "denied" if "127.0.0.1" in u else None),
+    )
+
+    result = await provider_module._extract_pdf("https://public.example/doc.pdf")
+
+    assert result["error_type"] == "blocked"
+    assert result["content"] == ""
+
+
+@pytest.mark.asyncio
+async def test_normalize_document_sanitizes_metadata_source_url() -> None:
+    result = provider_module._normalize_document(
+        {
+            "url": "https://example.com/page",
+            "markdown": "hello world " * 20,
+            "success": True,
+            "metadata": {"sourceURL": "https://example.com/path?token=sekrit"},
+        }
+    )
+
+    assert result["metadata"]["sourceURL"] == "https://example.com/path"
+
+
+@pytest.mark.asyncio
+async def test_secure_document_sanitizes_output_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+
+    result = await provider_module._secure_document(
+        {
+            "url": "https://example.com/redirected?token=sekrit",
+            "title": "",
+            "content": "x" * 500,
+            "raw_content": "x" * 500,
+            "metadata": {},
+        },
+        "https://example.com/page",
+    )
+
+    assert result["url"] == "https://example.com/redirected"
+
+
+@pytest.mark.asyncio
+async def test_crawl_seed_fragment_canonicalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    posted: list[str] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        posted.append(payload["url"])
+        return {
+            "url": payload["url"],
+            "markdown": "seed body",
+            "success": True,
+        }
+
+    monkeypatch.setattr(provider_module, "_post_json", post)
+
+    await crawl4ai_crawl_tool({"url": "https://example.com/seed#initial"})
+
+    assert posted == ["https://example.com/seed"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_rejected_link_scan_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    checks = [0]
+    real_same_site = provider_module._is_same_site
+
+    def counting_same_site(seed, candidate):
+        checks[0] += 1
+        return real_same_site(seed, candidate)
+
+    monkeypatch.setattr(provider_module, "_is_same_site", counting_same_site)
+    spam = " ".join(f"https://other.example/{i}" for i in range(10_000))
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        return {
+            "url": payload["url"],
+            "markdown": f"seed {spam}",
+            "success": True,
+        }
+
+    monkeypatch.setattr(provider_module, "_post_json", AsyncMock(side_effect=post))
+
+    await crawl4ai_crawl_tool({"url": "https://example.com/seed", "max_pages": 1})
+
+    # Budget fully spent after the seed: the only same-site check is the
+    # seed document's own output-boundary check — zero link scanning.
+    assert checks[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_crawl_link_exam_cap_bounds_junk_links(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    checks = [0]
+    real_same_site = provider_module._is_same_site
+
+    def counting_same_site(seed, candidate):
+        checks[0] += 1
+        return real_same_site(seed, candidate)
+
+    monkeypatch.setattr(provider_module, "_is_same_site", counting_same_site)
+    # 100 junk links, one legit link, then a 10k junk flood: the legit link
+    # must be found before the exam cap stops scanning.
+    head = " ".join(f"https://other.example/{i}" for i in range(100))
+    flood = " ".join(f"https://other.example/{i}" for i in range(100, 10_000))
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        return {
+            "url": payload["url"],
+            "markdown": f"seed {head} https://example.com/legit {flood}",
+            "success": True,
+        }
+
+    monkeypatch.setattr(provider_module, "_post_json", AsyncMock(side_effect=post))
+
+    result = json.loads(
+        await crawl4ai_crawl_tool({"url": "https://example.com/seed"})
+    )
+
+    # The 10k junk links are bounded by the per-page exam cap (2000), not 10k.
+    # (+2 for the seed and child documents' own output-boundary checks.)
+    assert checks[0] <= provider_module._MAX_LINKS_EXAMINED_PER_PAGE + 2
+    assert any(doc.get("url", "").endswith("/legit") for doc in result["results"])
