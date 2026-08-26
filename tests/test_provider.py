@@ -150,66 +150,84 @@ async def test_crawl_tool_rejects_unsafe_seed(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
-async def test_crawl_tool_clamps_depth_pages_and_filters_results(
+async def test_crawl_tool_clamps_pages_and_walks_same_site_links(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
-    post = AsyncMock(
-        return_value={
-            "results": [
-                {
-                    "url": f"https://example.com/{index}",
-                    "metadata": {"title": str(index)},
-                    "markdown": f"page {index}",
-                    "success": True,
-                }
-                for index in range(25)
-            ]
-        }
-    )
+    links = "\n".join(f"https://example.com/docs/{index}" for index in range(25))
+    pages: dict[str, dict] = {
+        "https://example.com/docs": {
+            "url": "https://example.com/docs",
+            "markdown": f"seed\n{links}",
+            "success": True,
+        },
+        **{
+            f"https://example.com/docs/{index}": {
+                "url": f"https://example.com/docs/{index}",
+                "markdown": f"page {index}",
+                "success": True,
+            }
+            for index in range(25)
+        },
+    }
+    calls: list[dict] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        assert path == "/md"
+        calls.append(dict(payload))
+        return pages[payload["url"]]
+
     monkeypatch.setattr(provider_module, "_post_json", post)
 
     result = json.loads(
-        await crawl4ai_crawl_tool(
-            {"url": "https://example.com/docs", "depth": "advanced", "max_pages": 999}
-        )
+        await crawl4ai_crawl_tool({"url": "https://example.com/docs", "max_pages": 999})
     )
 
-    payload = post.await_args.args[1]
-    assert payload["browser_config"] == {
-        "type": "BrowserConfig",
-        "params": {"headless": True},
-    }
-    assert payload["crawler_config"]["type"] == "CrawlerRunConfig"
-    strategy = payload["crawler_config"]["params"]["deep_crawl_strategy"]
-    assert strategy["params"] == {
-        "max_depth": 2,
-        "max_pages": 20,
-        "include_external": False,
-    }
+    # Client-side BFS over the flat /md endpoint — never the old /crawl payload.
+    assert calls and all(
+        "browser_config" not in payload and payload.get("f") == "fit" for payload in calls
+    )
+    # MAX_CRAWL_PAGES clamps the requested 999 to 20 fetched documents.
     assert len(result["results"]) == 20
+    assert result["results"][0]["url"] == "https://example.com/docs"
 
 
 @pytest.mark.asyncio
-async def test_crawl_tool_rejects_cross_site_results(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_crawl_tool_rejects_cross_site_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
-    monkeypatch.setattr(
-        provider_module,
-        "_post_json",
-        AsyncMock(
-            return_value={
-                "results": [
-                    {
-                        "url": "https://unrelated.example/page",
-                        "markdown": "should not be returned",
-                        "success": True,
-                    }
-                ]
-            }
-        ),
-    )
+    pages: dict[str, dict] = {
+        "https://example.com": {
+            "url": "https://example.com",
+            "markdown": "seed https://example.com/a and https://unrelated.example/b",
+            "success": True,
+        },
+        "https://example.com/a": {
+            "url": "https://example.com/a",
+            "markdown": "same-site child",
+            "success": True,
+        },
+        "https://unrelated.example/b": {
+            "url": "https://unrelated.example/b",
+            "markdown": "must never be fetched",
+            "success": True,
+        },
+    }
+    calls: list[str] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        calls.append(payload["url"])
+        return pages[payload["url"]]
+
+    monkeypatch.setattr(provider_module, "_post_json", post)
 
     result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com"}))
 
-    assert result["results"][0]["content"] == ""
-    assert "left the seed site" in result["results"][0]["error"]
+    # Cross-site links are filtered before fetching (queue-level _is_same_site).
+    assert "https://unrelated.example/b" not in calls
+    assert calls == ["https://example.com", "https://example.com/a"]
+    assert [doc["url"] for doc in result["results"]] == [
+        "https://example.com",
+        "https://example.com/a",
+    ]
