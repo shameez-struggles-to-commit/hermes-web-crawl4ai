@@ -768,7 +768,10 @@ async def _fetch_document(url: str, *, format: str | None = None) -> dict[str, A
       2. best-effort HEAD probe → PDF-by-content-type + early-out on 404/410
       3. Crawl4AI /md (fit → raw) or /html
       4. content-quality gate → typed error, with a scrapling stealth
-         escalation for challenge/blocked walls
+         escalation for challenge/block walls and empty shells
+      5. exception path → typed error, with a scrapling stealth escalation
+         when the TARGET is the suspect (401/403/5xx probe, or the probe
+         could not classify) — never to mask a Crawl4AI outage
     """
     if _url_is_pdf(url):
         return await _extract_pdf(url)

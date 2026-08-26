@@ -10,12 +10,40 @@ plugin registry while compatibility testing is underway.
 
 ### Stealth escalation (optional)
 
-When the content-quality gate flags a challenge/block (e.g. a Cloudflare
-wall) on an otherwise-successful Crawl4AI response, the plugin falls
-back to an in-process stealth fetch via [scrapling]. (Note: if the
-Crawl4AI container itself is down, that connection error is returned as
-a typed error — the stealth leg only engages on fetched-but-blocked
-documents.) The pinned dependency
+When extraction hits a bot wall, the plugin falls back to an in-process
+stealth fetch via [scrapling]. Stealth engages in two places:
+
+1. **Exception path** — Crawl4AI errored AND the target looks like the
+   suspect: the probe saw the target block/challenge us (HTTP 401/403/5xx —
+   Cloudflare's managed challenge is served as 503), or the probe could not
+   classify the target at all. A mapped-healthy probe (e.g. 200) with
+   Crawl4AI erroring is treated as OUR infrastructure failing and is
+   returned as a typed error — stealth never masks a Crawl4AI outage.
+2. **Content gate** — Crawl4AI "succeeded" but the content is a
+   challenge/block wall or an empty shell (common for JS-heavy pages a
+   plain HTTP fetch renders thin).
+
+Every stealth result is policy-checked against the browser's *final* URL
+(redirects can land on private networks), truncated to
+`max_chars_per_page`, and logged host-only with a grep-able
+`scrapling_stealth` token and outcome (`unavailable | failed |
+blocked_final_url | thin_content | rescued`).
+
+Known limits, stated plainly:
+
+- **Latency:** stealth runs take seconds to minutes (measured: 1.9s for
+  example.com, 18.8s for a ProductHunt turnstile solve, 207s for an IMDb
+  title page). The 30s fetch timeout is per wait-stage, not wall-clock.
+- **No cross-call resource bound:** the `concurrency` setting limits URLs
+  within one `extract()` call only; concurrent calls (and other Hermes
+  processes) can each run their own stealth fetches.
+- **Cancellation is best-effort:** cancelling a request does not stop the
+  browser run; it finishes its current stages in the background.
+- **Text-only:** `format=html` requests that escalate receive plain text
+  (scrapling's `get_all_text()`), never HTML.
+- The plugin-local `crawl4ai_crawl` tool never escalates to stealth.
+
+The pinned dependency
 `scrapling[fetchers]==0.4.14` self-installs on first use (set
 `HERMES_WEB_CRAWL4AI_NO_INSTALL=1` to forbid runtime installs — note this
 only disables *installing*: if scrapling is already importable, stealth
