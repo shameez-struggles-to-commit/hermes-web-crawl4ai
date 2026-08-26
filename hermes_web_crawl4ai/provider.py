@@ -796,9 +796,13 @@ async def _secure_document(document: dict[str, Any], fallback_url: str) -> dict[
 
 
 def _is_same_site(seed_url: str, candidate_url: str) -> bool:
-    """Accept the seed host and its subdomains; reject unrelated crawl results."""
-    seed_host = (urlparse(seed_url).hostname or "").lower().rstrip(".")
-    candidate_host = (urlparse(candidate_url).hostname or "").lower().rstrip(".")
+    """Accept the seed host and its subdomains; reject unrelated crawl
+    results. Malformed URLs parse to False rather than raising."""
+    try:
+        seed_host = (urlparse(seed_url).hostname or "").lower().rstrip(".")
+        candidate_host = (urlparse(candidate_url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
     if not seed_host or not candidate_host:
         return False
     return candidate_host == seed_host or candidate_host.endswith(f".{seed_host}")
@@ -952,7 +956,7 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
     """
     try:
         import re
-        from urllib.parse import urljoin
+        from urllib.parse import urljoin, urldefrag
 
         from tools.web_tools import sensitive_query_param_name
 
@@ -994,17 +998,24 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
 
         def _candidates(text: str, page_url: str):
             """Yield absolute same-site URLs found in markdown or hrefs —
-            relative hrefs resolved against the page they appeared on."""
+            relative hrefs resolved against the page they appeared on.
+            Fragments are canonicalized away, credential-like query
+            parameters disqualify a candidate outright."""
             for match in link_re.finditer(text):
                 absolute = match.group(1)
                 if absolute is None:
                     absolute = match.group(0)
                     if absolute.lower().startswith(("mailto:", "javascript:", "tel:", "data:")):
                         continue
-                candidate = urljoin(page_url, absolute).rstrip(".,;!?)")
-                if candidate in seen or candidate in queued:
+                candidate = urldefrag(
+                    urljoin(page_url, absolute).rstrip(".,;!?)")
+                ).url
+                if not candidate or candidate in seen or candidate in queued:
                     continue
                 if not candidate.lower().startswith(("http://", "https://")):
+                    continue
+                if sensitive_query_param_name(candidate):
+                    # Never send credential-bearing URLs to the backend.
                     continue
                 if _is_same_site(url, candidate):
                     yield candidate
@@ -1032,13 +1043,16 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
 
             # The queue filters candidate links, but the endpoint itself can
             # still return a redirected/unrelated document — enforce the
-            # same-site boundary on output too.
+            # same-site boundary on output too, and never echo a
+            # credential-bearing redirect URL back to the caller.
             doc_url = str(document.get("url") or current)
             if not _is_same_site(url, doc_url):
                 document = _error_document(
-                    doc_url,
+                    current,
                     "Result URL left the seed site and was not returned",
                 )
+            elif sensitive_query_param_name(doc_url):
+                document["url"] = _url_without_query(doc_url)
 
             documents.append(await _secure_document(document, current))
 
@@ -1047,6 +1061,10 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
                 for candidate in _candidates(text, current):
                     queued.add(candidate)
                     queue.append((candidate, depth + 1))
+                    # Bound scanning too: once the page budget is fully
+                    # spoken for (fetched + queued), stop extracting links.
+                    if len(documents) + len(queue) >= max_pages:
+                        break
 
         return json.dumps({"results": documents}, ensure_ascii=False)
     except asyncio.CancelledError:

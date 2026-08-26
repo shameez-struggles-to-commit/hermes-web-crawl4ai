@@ -1048,3 +1048,147 @@ async def test_crawl_queue_dedups_repeated_links(
     await crawl4ai_crawl_tool({"url": "https://example.com/seed"})
 
     assert posted.await_count == 2  # seed + the single deduped child
+
+
+# ---------------------------------------------------------------------------
+# Round-4 review fixes: child credential guard, fragment dedup, scan budget,
+# malformed URL resilience, output URL hygiene
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crawl_child_credential_link_never_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    posted: list[str] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        posted.append(payload["url"])
+        if payload["url"].endswith("/seed"):
+            return {
+                "url": payload["url"],
+                "markdown": (
+                    'seed <a href="https://example.com/child?token=sekrit">c</a>'
+                ),
+                "success": True,
+            }
+        raise AssertionError("credential-bearing child must never be fetched")
+
+    monkeypatch.setattr(provider_module, "_post_json", post)
+
+    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com/seed"}))
+
+    assert posted == ["https://example.com/seed"]
+    # The credential URL is never fetched and never becomes a document URL.
+    # (Page CONTENT containing such strings is untouched — that's the page's
+    # own text, not something we transmit.)
+    assert all("token=" not in doc.get("url", "") for doc in result["results"])
+    assert len(result["results"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_crawl_strips_credential_query_from_returned_doc_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        provider_module,
+        "_post_json",
+        AsyncMock(
+            return_value={
+                "url": "https://example.com/redirected?token=sekrit",
+                "markdown": "content after redirect",
+                "success": True,
+            }
+        ),
+    )
+
+    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com/seed"}))
+
+    doc = result["results"][0]
+    assert doc["url"] == "https://example.com/redirected"
+    assert "sekrit" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_crawl_fragment_links_deduped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    pages: dict[str, dict] = {
+        "https://example.com/seed": {
+            "url": "https://example.com/seed",
+            "markdown": (
+                'seed <a href="https://example.com/target#a">a</a> '
+                '<a href="https://example.com/target#b">b</a> '
+                '<a href="https://example.com/target">c</a>'
+            ),
+            "success": True,
+        },
+        "https://example.com/target": {
+            "url": "https://example.com/target",
+            "markdown": "target",
+            "success": True,
+        },
+    }
+    calls: list[str] = []
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        calls.append(payload["url"])
+        return pages[payload["url"]]
+
+    monkeypatch.setattr(provider_module, "_post_json", post)
+
+    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com/seed"}))
+
+    # Three fragment variants of one URL = one fetch, not three.
+    assert calls == ["https://example.com/seed", "https://example.com/target"]
+    assert len(result["results"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_crawl_scan_budget_bounded_by_max_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    spam = " ".join(f"https://example.com/u{i}" for i in range(10_000))
+
+    async def post(path: str, payload: dict, timeout: int) -> dict:
+        return {
+            "url": payload["url"],
+            "markdown": f"seed {spam}",
+            "success": True,
+        }
+
+    posted = AsyncMock(side_effect=post)
+    monkeypatch.setattr(provider_module, "_post_json", posted)
+
+    await crawl4ai_crawl_tool({"url": "https://example.com/seed", "max_pages": 1})
+
+    # Only the seed is fetched; scanning stops once the budget is spent.
+    assert posted.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_crawl_malformed_backend_url_does_not_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        provider_module,
+        "_post_json",
+        AsyncMock(
+            return_value={
+                "url": "http://[::1",
+                "markdown": "unreachable content",
+                "success": True,
+            }
+        ),
+    )
+
+    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com"}))
+
+    # Per-page rejection, not a whole-tool failure.
+    assert "success" not in result or result.get("results") is not None
+    assert result["results"][0]["content"] == ""

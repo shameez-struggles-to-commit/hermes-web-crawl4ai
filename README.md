@@ -77,8 +77,8 @@ shares Playwright's browser cache).
 - `crawl4ai`, an extract-only `WebSearchProvider` used by Hermes' existing
   `web_extract` tool.
 - `crawl4ai_crawl`, an optional plugin-local tool for bounded deep crawling.
-- Compatibility with Crawl4AI's flat `/md` and `/html` endpoints and its
-  `/crawl` response envelopes.
+- Compatibility with Crawl4AI's flat `/md` and `/html` endpoints and their
+  response envelopes.
 - Hermes URL-safety and website-policy checks on requested and returned URLs.
 
 Hermes already bundles a SearXNG search provider, so this plugin does not copy
@@ -91,8 +91,9 @@ stable release yet. The initial target is the security-hardened Crawl4AI
 v0.8.9 REST service.
 
 Validated locally on 2026-07-12 against the pinned Crawl4AI 0.8.9 container:
-real `/md`, `/html`, and typed bounded `/crawl` requests all pass. Broader
-deployment testing is still wanted before registry or catalog promotion.
+real `/md` and `/html` requests pass; crawling runs client-side over the
+flat `/md` endpoint. Broader deployment testing is still wanted before
+registry or catalog promotion.
 
 ## Install for testing
 
@@ -125,7 +126,6 @@ plugins:
       config:
         api_url: http://localhost:11235
         timeout_seconds: 120
-        crawl_timeout_seconds: 180
         concurrency: 4
         max_chars_per_page: 20000
 
