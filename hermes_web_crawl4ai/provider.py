@@ -147,7 +147,7 @@ def _sanitize_url_for_output(url: str) -> str:
     before it reaches logs or the caller. Host-based policy matching is
     unaffected; non-sensitive query strings are preserved verbatim."""
     try:
-        from tools.web_tools import sensitive_query_param_name
+        from tools.url_safety import sensitive_query_param_name
     except Exception:  # pragma: no cover — Hermes core always provides it
         return url
     try:
@@ -1021,7 +1021,7 @@ async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
         import re
         from urllib.parse import urldefrag, urljoin
 
-        from tools.web_tools import sensitive_query_param_name
+        from tools.url_safety import sensitive_query_param_name
 
         url = normalize_url_for_request(str(args.get("url") or "").strip())
         if not url:
