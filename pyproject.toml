@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "axAilotl" }]
-dependencies = ["httpx>=0.27,<1"]
+# scrapling powers the stealth-escalation leg. Declared here (not only as an extra) so Hermes' package manager
+# installs it into the managed environment and re-applies it after every `hermes update`.
+dependencies = ["httpx>=0.27,<1", "scrapling[fetchers]==0.4.14"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: MIT License",

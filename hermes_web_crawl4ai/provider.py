@@ -527,6 +527,17 @@ async def _resolve_scrapling_fetcher_async():
         return None
 
 
+def _hermes_chromium_path() -> str | None:
+    """Hermes' managed Chromium (None when unavailable, so scrapling falls back to its own default)."""
+    try:
+        from hermes_cli.browser_runtime import chromium_executable
+
+        found = chromium_executable()
+        return found if found and os.path.isfile(found) else None
+    except Exception:  # noqa: BLE001 — resolution never breaks the fetch
+        return None
+
+
 async def _stealth_fetch(url: str) -> dict[str, Any] | None:
     """Last-resort stealth fetch via scrapling when the content gate flags a
     challenge/block, or the exception path sees the target block/challenge us.
@@ -566,6 +577,12 @@ async def _stealth_fetch(url: str) -> dict[str, Any] | None:
 
     def _run() -> tuple[str, str]:
         fetcher = fetcher_cls()
+        launch_extra: dict[str, Any] = {}
+        # Use Hermes' own managed Chromium: scrapling's bundled engine wants a browser revision that
+        # Hermes' package manager does not ship, and fails with "Executable doesn't exist" otherwise.
+        exe = _hermes_chromium_path()
+        if exe:
+            launch_extra["executable_path"] = exe
         with _quiet_scrapling_logs():
             page = fetcher.fetch(
                 url,
@@ -574,6 +591,7 @@ async def _stealth_fetch(url: str) -> dict[str, Any] | None:
                 network_idle=True,
                 wait_selector="body",
                 timeout=30000,
+                **launch_extra,
             )
         if page is None:
             return ("", "")
